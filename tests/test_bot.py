@@ -174,11 +174,13 @@ class BotFlowTests(unittest.TestCase):
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("DELETE FROM conversation_messages")
             conn.execute("DELETE FROM pending_actions")
+            conn.execute("DELETE FROM atlas_conversation_context")
 
     def tearDown(self):
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("DELETE FROM conversation_messages")
             conn.execute("DELETE FROM pending_actions")
+            conn.execute("DELETE FROM atlas_conversation_context")
 
     def make_atlas_payload(self, status: str, message: str, data=None, action_id=None, confirmation_id=None):
         return SimpleNamespace(
@@ -283,6 +285,73 @@ class BotFlowTests(unittest.TestCase):
 
         self.assertEqual(len(self.sent_messages), 1)
         self.assertEqual(self.sent_messages[0][1], "Claro, posso ajudar com isso.")
+
+    def test_atlas_context_routes_selection_period_and_references_with_stable_conversation_id(self):
+        fake_atlas = FakeAtlasClient(
+            response=self.make_atlas_payload("completed", "Continuando no Atlas.")
+        )
+
+        with patch.object(app_module, "atlas_client", fake_atlas), \
+             patch.object(app_module, "generate_openai_reply") as local_openai, \
+             patch.object(app_module, "send_telegram_message", return_value=True):
+            for text in (
+                "como está a campanha X?",
+                "1",
+                "7 dias",
+                "ambas",
+                "a primeira",
+                "essa",
+            ):
+                app_module.handle_message(2001, 123456789, text)
+
+        self.assertEqual([call["message"] for call in fake_atlas.calls], [
+            "como está a campanha X?", "1", "7 dias", "ambas", "a primeira", "essa"
+        ])
+        self.assertEqual(
+            {call["conversation_id"] for call in fake_atlas.calls},
+            {"telegram:2001"},
+        )
+        local_openai.assert_not_called()
+
+    def test_clearly_casual_message_exits_atlas_context_safely(self):
+        fake_atlas = FakeAtlasClient(
+            response=self.make_atlas_payload("completed", "Campanha encontrada.")
+        )
+
+        with patch.object(app_module, "atlas_client", fake_atlas), \
+             patch.object(app_module, "generate_openai_reply", return_value="Tudo bem!" ) as local_openai, \
+             patch.object(app_module, "send_telegram_message", return_value=True):
+            app_module.handle_message(2002, 123456789, "como está a campanha X?")
+            app_module.handle_message(2002, 123456789, "oi, tudo bem?")
+
+        self.assertEqual(len(fake_atlas.calls), 1)
+        local_openai.assert_called_once_with("2002", "oi, tudo bem?")
+        self.assertIsNone(app_module.load_atlas_context("2002"))
+
+    def test_write_and_confirmation_stay_on_atlas_with_same_conversation_id(self):
+        responses = [
+            self.make_atlas_payload(
+                "confirmation_required", "Confirma?", action_id="action-1", confirmation_id="confirmation-1"
+            ),
+            self.make_atlas_payload("completed", "Executado."),
+        ]
+        fake_atlas = FakeAtlasClient()
+        fake_atlas.send_command = lambda **kwargs: fake_atlas.calls.append(kwargs) or responses.pop(0)
+
+        with patch.object(app_module, "atlas_client", fake_atlas), \
+             patch.object(app_module, "generate_openai_reply") as local_openai, \
+             patch.object(app_module, "send_telegram_message", return_value=True):
+            app_module.handle_message(2003, 123456789, "pausa a campanha X")
+            app_module.handle_message(2003, 123456789, "confirmo")
+
+        self.assertEqual(len(fake_atlas.calls), 2)
+        self.assertEqual(
+            [call["conversation_id"] for call in fake_atlas.calls],
+            ["telegram:2003", "telegram:2003"],
+        )
+        self.assertEqual(fake_atlas.calls[1]["action_id"], "action-1")
+        self.assertEqual(fake_atlas.calls[1]["confirmation_id"], "confirmation-1")
+        local_openai.assert_not_called()
 
     def test_unauthorized_user_is_blocked(self):
         with patch.object(app_module, "atlas_client", FakeAtlasClient(configured=True)), \

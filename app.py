@@ -4,6 +4,7 @@ import os
 import sqlite3
 import tempfile
 import threading
+import time
 import unicodedata
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -38,6 +39,7 @@ MAX_CONTEXT_CHARACTERS = 12000
 TELEGRAM_MESSAGE_LIMIT = 4000
 OPENAI_TIMEOUT_SECONDS = 45
 TELEGRAM_TIMEOUT_SECONDS = 15
+ATLAS_CONTEXT_TTL_SECONDS = int(os.getenv("ATLAS_CONTEXT_TTL_SECONDS", "1800"))
 
 FALLBACK_ERROR_MESSAGE = (
     "Tive um problema pra processar sua mensagem agora. "
@@ -112,6 +114,19 @@ ADS_KEYWORDS = (
     "meta business",
 )
 
+CLEAR_LOCAL_CONVERSATION_PATTERNS = (
+    "oi",
+    "ola",
+    "oi tudo bem",
+    "ola tudo bem",
+    "bom dia",
+    "boa tarde",
+    "boa noite",
+    "como voce esta",
+    "como vai voce",
+    "me ajuda a organizar um projeto",
+)
+
 
 def init_db() -> None:
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
@@ -140,6 +155,15 @@ def init_db() -> None:
                 action_id TEXT NOT NULL,
                 confirmation_id TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS atlas_conversation_context (
+                chat_id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
                 updated_at INTEGER NOT NULL
             )
             """
@@ -271,6 +295,48 @@ def clear_pending_action(chat_id: str) -> None:
             conn.execute("DELETE FROM pending_actions WHERE chat_id = ?", (chat_id,))
 
 
+def load_atlas_context(chat_id: str) -> Optional[Dict[str, str]]:
+    with get_db_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT conversation_id, updated_at
+            FROM atlas_conversation_context
+            WHERE chat_id = ?
+            """,
+            (chat_id,),
+        ).fetchone()
+
+    if not row:
+        return None
+    if int(time.time()) - int(row[1]) > ATLAS_CONTEXT_TTL_SECONDS:
+        clear_atlas_context(chat_id)
+        return None
+    return {"conversation_id": row[0], "updated_at": str(row[1])}
+
+
+def activate_atlas_context(chat_id: str) -> str:
+    conversation_id = f"telegram:{chat_id}"
+    with DB_LOCK:
+        with get_db_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO atlas_conversation_context (chat_id, conversation_id, updated_at)
+                VALUES (?, ?, strftime('%s', 'now'))
+                ON CONFLICT(chat_id) DO UPDATE SET updated_at = excluded.updated_at
+                """,
+                (chat_id, conversation_id),
+            )
+    return conversation_id
+
+
+def clear_atlas_context(chat_id: str) -> None:
+    with DB_LOCK:
+        with get_db_connection() as conn:
+            conn.execute(
+                "DELETE FROM atlas_conversation_context WHERE chat_id = ?", (chat_id,)
+            )
+
+
 def normalize_text(text: str) -> str:
     normalized = unicodedata.normalize("NFKD", text)
     normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
@@ -385,6 +451,11 @@ def detect_ads_intent(text: str) -> Optional[Dict[str, str]]:
     return None
 
 
+def is_clearly_local_conversation(text: str) -> bool:
+    normalized = normalize_text(text).strip(" !?.")
+    return normalized in CLEAR_LOCAL_CONVERSATION_PATTERNS
+
+
 def is_confirmation_text(text: str) -> bool:
     normalized = normalize_text(text)
     confirmation_patterns = (
@@ -436,13 +507,19 @@ def atlas_request(
 ) -> Any:
     if not atlas_client.is_configured():
         return None
-    return atlas_client.send_command(
+    context = load_atlas_context(chat_id)
+    conversation_id = (
+        context["conversation_id"] if context else activate_atlas_context(chat_id)
+    )
+    result = atlas_client.send_command(
         message=text,
         external_user_id=str(chat_id),
-        conversation_id=f"telegram:{chat_id}",
+        conversation_id=conversation_id,
         action_id=action_id,
         confirmation_id=confirmation_id,
     )
+    activate_atlas_context(chat_id)
+    return result
 
 
 def atlas_response_text(result: Any, default_text: str) -> str:
@@ -579,16 +656,41 @@ def handle_message(chat_id: int, user_id: Optional[int], user_text: str) -> None
     try:
         pending_reply = handle_pending_confirmation(chat_key, user_id or 0, user_text)
         if pending_reply is not None:
+            logger.info(
+                "route=atlas chat_id=%s message_length=%s reason=pending_confirmation",
+                chat_id,
+                len(user_text),
+            )
             reply_text = pending_reply
         else:
             intent = detect_ads_intent(user_text)
             if intent:
+                logger.info(
+                    "route=atlas chat_id=%s message_length=%s reason=ads_intent",
+                    chat_id,
+                    len(user_text),
+                )
                 reply_text = (
                     handle_atlas_action(chat_key, user_id or 0, user_text)
                     if intent["kind"] == "action"
                     else handle_atlas_query(chat_key, user_id or 0, user_text)
                 )
+            elif load_atlas_context(chat_key) and not is_clearly_local_conversation(user_text):
+                logger.info(
+                    "route=atlas chat_id=%s message_length=%s reason=atlas_context",
+                    chat_id,
+                    len(user_text),
+                )
+                reply_text = handle_atlas_query(chat_key, user_id or 0, user_text)
             else:
+                reason = "explicit_local_exit" if load_atlas_context(chat_key) else "no_ads_context"
+                clear_atlas_context(chat_key)
+                logger.info(
+                    "route=local_openai chat_id=%s message_length=%s reason=%s",
+                    chat_id,
+                    len(user_text),
+                    reason,
+                )
                 reply_text = generate_openai_reply(chat_key, user_text)
 
         store_message(chat_key, "assistant", reply_text)
