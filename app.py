@@ -70,7 +70,8 @@ client = (
 atlas_client = AtlasAdsClient(
     base_url=ATLAS_ADS_API_URL,
     api_key=ATLAS_ADS_API_KEY,
-    timeout=20,
+    connect_timeout=5,
+    read_timeout=90,
 )
 
 ADS_ACTION_COMMANDS: List[Tuple[str, Tuple[str, ...]]] = [

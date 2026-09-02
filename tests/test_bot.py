@@ -66,6 +66,29 @@ class FakeAtlasClient:
 
 
 class AtlasClientTests(unittest.TestCase):
+    def test_production_timeout_is_split_and_no_retry_is_configured(self):
+        session = FakeSession(FakeResponse(200, {"ok": True}))
+        client = AtlasAdsClient("https://atlas.example.com", "atlas-key", session=session)
+        client.request("POST", "/api/integrations/telegram/command", json_body={"message": "read"})
+
+        self.assertEqual(session.calls[0]["timeout"], (5.0, 90.0))
+        self.assertEqual(len(session.calls), 1)
+
+    def test_connect_and_read_timeouts_are_distinguished_without_retry(self):
+        for exception, text in (
+            (requests.ConnectTimeout(), "Timeout de conexao"),
+            (requests.ReadTimeout(), "Timeout de leitura"),
+        ):
+            with self.subTest(exception=type(exception).__name__), self.assertLogs("atlas_ads_client", level="WARNING") as logs:
+                session = FakeSession(exception=exception)
+                result = AtlasAdsClient("https://atlas.example.com", "atlas-key", session=session).send_command(
+                    message="read", external_user_id="123", conversation_id="telegram:123"
+                )
+            self.assertFalse(result.ok)
+            self.assertIn(text, result.error)
+            self.assertEqual(len(session.calls), 1)
+            self.assertNotIn("atlas-key", "".join(logs.output))
+
     def test_health_check_uses_exact_contract_and_bearer_header(self):
         session = FakeSession(
             FakeResponse(

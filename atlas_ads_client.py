@@ -1,4 +1,5 @@
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 from urllib.parse import urljoin
@@ -28,12 +29,20 @@ class AtlasAdsClient:
         self,
         base_url: Optional[str],
         api_key: Optional[str],
-        timeout: int = 20,
+        timeout: Optional[float] = None,
+        connect_timeout: float = 5.0,
+        read_timeout: float = 90.0,
         session: Optional[requests.Session] = None,
     ) -> None:
         self.base_url = (base_url or "").strip().rstrip("/")
         self.api_key = (api_key or "").strip()
-        self.timeout = timeout
+        # ``timeout`` is retained for callers that explicitly supplied the old
+        # value; production uses the separate connect/read defaults below.
+        if timeout is not None:
+            read_timeout = timeout
+        self.connect_timeout = connect_timeout
+        self.read_timeout = read_timeout
+        self.timeout = (self.connect_timeout, self.read_timeout)
         self.session = session or requests.Session()
 
     def is_configured(self) -> bool:
@@ -104,6 +113,7 @@ class AtlasAdsClient:
             )
 
         url = self._build_url(path)
+        started = time.monotonic()
         try:
             response = self.session.request(
                 method=method.upper(),
@@ -111,14 +121,37 @@ class AtlasAdsClient:
                 params=params,
                 json=json_body,
                 headers=self._headers(),
-                timeout=self.timeout,
+                timeout=(self.connect_timeout, self.read_timeout),
             )
-        except requests.Timeout:
-            logger.warning("Timeout ao chamar o Atlas Ads AI em %s %s", method.upper(), path)
+        except requests.ConnectTimeout:
+            logger.warning(
+                "Timeout de conexao ao chamar o Atlas Ads AI em %s %s (%.1fs)",
+                method.upper(), path, time.monotonic() - started,
+            )
+            return AtlasAdsResult(
+                ok=False, status_code=None, data=None,
+                error="Timeout de conexao ao chamar o Atlas Ads AI.",
+                friendly_message=ATLAS_OFFLINE_FRIENDLY_MESSAGE,
+            )
+        except requests.ReadTimeout:
+            logger.warning(
+                "Timeout de leitura ao chamar o Atlas Ads AI em %s %s apos %.1fs",
+                method.upper(), path, time.monotonic() - started,
+            )
             return AtlasAdsResult(
                 ok=False,
                 status_code=None,
                 data=None,
+                error="Timeout de leitura ao chamar o Atlas Ads AI.",
+                friendly_message=ATLAS_OFFLINE_FRIENDLY_MESSAGE,
+            )
+        except requests.Timeout:
+            logger.warning(
+                "Timeout ao chamar o Atlas Ads AI em %s %s apos %.1fs",
+                method.upper(), path, time.monotonic() - started,
+            )
+            return AtlasAdsResult(
+                ok=False, status_code=None, data=None,
                 error="Timeout ao chamar o Atlas Ads AI.",
                 friendly_message=ATLAS_OFFLINE_FRIENDLY_MESSAGE,
             )
