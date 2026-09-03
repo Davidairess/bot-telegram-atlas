@@ -77,7 +77,11 @@ MEMORY_PROMPT = (
 
 DB_LOCK = threading.Lock()
 client = (
-    OpenAI(api_key=OPENAI_API_KEY, timeout=OPENAI_TIMEOUT_SECONDS)
+    OpenAI(
+        api_key=OPENAI_API_KEY,
+        timeout=OPENAI_TIMEOUT_SECONDS,
+        max_retries=0,
+    )
     if OPENAI_API_KEY
     else None
 )
@@ -480,11 +484,13 @@ def load_relevant_memories(
     total = 0
     limited = []
     for memory in relevant:
-        size = len(memory["content"])
-        if limited and total + size > MAX_MEMORY_CHARACTERS:
+        remaining = MAX_MEMORY_CHARACTERS - total
+        if remaining <= 0:
             break
-        limited.append(memory)
-        total += size
+        content = memory["content"][:remaining]
+        if content:
+            limited.append({**memory, "content": content})
+            total += len(content)
     return limited, durable_available
 
 
@@ -699,10 +705,25 @@ def generate_openai_reply(
         raise RuntimeError("OPENAI_API_KEY nao configurada.")
 
     messages = build_openai_messages(chat_id, external_user_id, user_text)
-    response = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=messages,
+    started = time.monotonic()
+    logger.info(
+        "request_started route=chat_completion external_service=openai chat_id=%s context_messages=%s",
+        chat_id,
+        len(messages),
     )
+    try:
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+        )
+    except Exception as exc:
+        result = "timeout" if "timeout" in type(exc).__name__.lower() else "error"
+        logger.warning(
+            "external_service=openai duration_ms=%s result=%s",
+            int((time.monotonic() - started) * 1000),
+            result,
+        )
+        raise
 
     choice = response.choices[0] if response.choices else None
     assistant_text = ""
@@ -710,8 +731,16 @@ def generate_openai_reply(
         assistant_text = (choice.message.content or "").strip()
 
     if not assistant_text:
+        logger.warning(
+            "external_service=openai duration_ms=%s result=error error_type=empty_response",
+            int((time.monotonic() - started) * 1000),
+        )
         raise RuntimeError("A OpenAI retornou uma resposta vazia.")
 
+    logger.info(
+        "external_service=openai duration_ms=%s result=success",
+        int((time.monotonic() - started) * 1000),
+    )
     return assistant_text
 
 
@@ -1072,6 +1101,8 @@ def inicio():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    started = time.monotonic()
+    logger.info("request_started route=webhook")
     try:
         dados = request.get_json(silent=True) or {}
 
@@ -1088,9 +1119,17 @@ def webhook():
                 next(iter(dados.keys()), "desconhecido"),
             )
 
+        logger.info(
+            "route=webhook duration_ms=%s result=success",
+            int((time.monotonic() - started) * 1000),
+        )
         return "ok", 200
     except Exception:
         logger.exception("Erro inesperado no webhook")
+        logger.warning(
+            "route=webhook duration_ms=%s result=error",
+            int((time.monotonic() - started) * 1000),
+        )
         return "ok", 200
 
 

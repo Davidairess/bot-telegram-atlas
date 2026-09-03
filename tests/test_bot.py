@@ -4,6 +4,7 @@ import sqlite3
 import tempfile
 import unittest
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -217,6 +218,38 @@ class AtlasClientTests(unittest.TestCase):
 
 
 class SupabaseMemoryClientTests(unittest.TestCase):
+    def test_all_http_calls_have_explicit_split_timeouts(self):
+        session = FakeSession(FakeResponse(200, []))
+        store = SupabaseMemory("https://project.supabase.co", "service-secret", session=session)
+
+        store.load_recent_messages("user-1", "chat-1", "telegram:chat-1", 40)
+        store.load_memories("user-1", "chat-1", "telegram:chat-1", 20)
+
+        self.assertEqual([call["timeout"] for call in session.calls], [(3.0, 10.0)] * 2)
+
+    def test_postgrest_reads_enforce_internal_maximum_limits(self):
+        session = FakeSession(FakeResponse(200, []))
+        store = SupabaseMemory("https://project.supabase.co", "service-secret", session=session)
+
+        store.load_recent_messages("user-1", "chat-1", "telegram:chat-1", 10000)
+        store.load_memories("user-1", "chat-1", "telegram:chat-1", 10000)
+
+        self.assertEqual(session.calls[0]["params"]["limit"], "40")
+        self.assertEqual(session.calls[1]["params"]["limit"], "20")
+
+    def test_timeout_is_bounded_and_reported_without_secrets(self):
+        session = FakeSession(exception=requests.ReadTimeout())
+        store = SupabaseMemory("https://project.supabase.co", "service-secret", session=session)
+
+        with self.assertLogs("supabase_memory", level="WARNING") as logs:
+            with self.assertRaises(SupabaseMemoryError):
+                store.load_memories("user-1", "chat-1", "telegram:chat-1", 20)
+
+        self.assertEqual(len(session.calls), 1)
+        self.assertEqual(session.calls[0]["timeout"], (3.0, 10.0))
+        self.assertIn("result=timeout", "".join(logs.output))
+        self.assertNotIn("service-secret", "".join(logs.output))
+
     def test_message_queries_use_exact_tables_columns_and_scope(self):
         session = FakeSession(FakeResponse(201, None))
         store = SupabaseMemory("https://project.supabase.co", "service-secret", session=session)
@@ -380,6 +413,32 @@ class BotFlowTests(unittest.TestCase):
 
         self.assertEqual(len(self.sent_messages), 1)
         self.assertEqual(self.sent_messages[0][1], "Claro, posso ajudar com isso.")
+
+    def test_local_openai_history_is_limited_by_count_and_characters(self):
+        oversized_history = [
+            {"role": "user", "content": str(index) + ("x" * 999)}
+            for index in range(100)
+        ]
+        with patch.object(app_module, "load_recent_messages", return_value=app_module.trim_messages_to_char_budget(
+            oversized_history[-app_module.MAX_CONTEXT_MESSAGES_PER_REQUEST:],
+            app_module.MAX_CONTEXT_CHARACTERS,
+        )), patch.object(app_module, "load_relevant_memories", return_value=([], True)):
+            messages = app_module.build_openai_messages("chat", "user", "nova")
+
+        history = messages[1:-1]
+        self.assertLessEqual(len(history), app_module.MAX_CONTEXT_MESSAGES_PER_REQUEST)
+        self.assertLessEqual(sum(len(item["content"]) for item in history), app_module.MAX_CONTEXT_CHARACTERS)
+
+    def test_relevant_memory_is_strictly_limited_by_characters(self):
+        oversized = {"memory_key": "large", "content": "x" * 10000}
+        store = FakePersistentStore()
+        with patch.object(store, "load_memories", return_value=[oversized]), \
+             patch.object(app_module, "supabase_store", store):
+            memories, _ = app_module.load_relevant_memories("user", "chat", "minhas memorias")
+
+        self.assertEqual(len(memories), 1)
+        self.assertEqual(len(memories[0]["content"]), app_module.MAX_MEMORY_CHARACTERS)
+
 
     def test_atlas_context_routes_selection_period_and_references_with_stable_conversation_id(self):
         fake_atlas = FakeAtlasClient(
@@ -619,6 +678,16 @@ class BotFlowTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
+
+
+class GunicornConfigurationTests(unittest.TestCase):
+    def test_gunicorn_timeout_exceeds_synchronous_external_budget(self):
+        procfile = Path(__file__).resolve().parents[1].joinpath("Procfile").read_text(encoding="utf-8")
+
+        self.assertIn("--workers 1", procfile)
+        self.assertIn("--worker-class sync", procfile)
+        self.assertIn("--timeout 180", procfile)
+        self.assertGreater(180, 5 + 90 + (4 * (3 + 10)) + 15)
 
 
 if __name__ == "__main__":

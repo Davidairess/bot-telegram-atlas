@@ -114,6 +114,10 @@ class AtlasAdsClient:
 
         url = self._build_url(path)
         started = time.monotonic()
+        logger.info(
+            "request_started route=atlas_api external_service=atlas operation=%s",
+            method.upper(),
+        )
         try:
             response = self.session.request(
                 method=method.upper(),
@@ -125,8 +129,8 @@ class AtlasAdsClient:
             )
         except requests.ConnectTimeout:
             logger.warning(
-                "Timeout de conexao ao chamar o Atlas Ads AI em %s %s (%.1fs)",
-                method.upper(), path, time.monotonic() - started,
+                "external_service=atlas duration_ms=%s result=timeout timeout_type=connect",
+                int((time.monotonic() - started) * 1000),
             )
             return AtlasAdsResult(
                 ok=False, status_code=None, data=None,
@@ -135,8 +139,8 @@ class AtlasAdsClient:
             )
         except requests.ReadTimeout:
             logger.warning(
-                "Timeout de leitura ao chamar o Atlas Ads AI em %s %s apos %.1fs",
-                method.upper(), path, time.monotonic() - started,
+                "external_service=atlas duration_ms=%s result=timeout timeout_type=read",
+                int((time.monotonic() - started) * 1000),
             )
             return AtlasAdsResult(
                 ok=False,
@@ -147,8 +151,8 @@ class AtlasAdsClient:
             )
         except requests.Timeout:
             logger.warning(
-                "Timeout ao chamar o Atlas Ads AI em %s %s apos %.1fs",
-                method.upper(), path, time.monotonic() - started,
+                "external_service=atlas duration_ms=%s result=timeout timeout_type=other",
+                int((time.monotonic() - started) * 1000),
             )
             return AtlasAdsResult(
                 ok=False, status_code=None, data=None,
@@ -156,6 +160,10 @@ class AtlasAdsClient:
                 friendly_message=ATLAS_OFFLINE_FRIENDLY_MESSAGE,
             )
         except requests.ConnectionError:
+            logger.warning(
+                "external_service=atlas duration_ms=%s result=error error_type=connection",
+                int((time.monotonic() - started) * 1000),
+            )
             logger.warning("Falha de conexão ao chamar o Atlas Ads AI em %s %s", method.upper(), path)
             return AtlasAdsResult(
                 ok=False,
@@ -165,6 +173,10 @@ class AtlasAdsClient:
                 friendly_message=ATLAS_OFFLINE_FRIENDLY_MESSAGE,
             )
         except requests.RequestException:
+            logger.warning(
+                "external_service=atlas duration_ms=%s result=error error_type=request",
+                int((time.monotonic() - started) * 1000),
+            )
             logger.exception("Erro de rede ao chamar o Atlas Ads AI em %s %s", method.upper(), path)
             return AtlasAdsResult(
                 ok=False,
@@ -177,6 +189,10 @@ class AtlasAdsClient:
         data = self._parse_json(response)
         if 200 <= response.status_code < 300:
             if data is None:
+                logger.warning(
+                    "external_service=atlas duration_ms=%s result=error error_type=invalid_json",
+                    int((time.monotonic() - started) * 1000),
+                )
                 logger.warning(
                     "Atlas Ads AI retornou HTTP %s com JSON inválido em %s %s",
                     response.status_code,
@@ -191,6 +207,10 @@ class AtlasAdsClient:
                     friendly_message=ATLAS_INVALID_JSON_MESSAGE,
                 )
 
+            logger.info(
+                "external_service=atlas duration_ms=%s result=success",
+                int((time.monotonic() - started) * 1000),
+            )
             return AtlasAdsResult(
                 ok=True,
                 status_code=response.status_code,
@@ -199,6 +219,11 @@ class AtlasAdsClient:
                 friendly_message="",
             )
 
+        logger.warning(
+            "external_service=atlas duration_ms=%s result=error status=%s",
+            int((time.monotonic() - started) * 1000),
+            response.status_code,
+        )
         logger.warning(
             "Atlas Ads AI respondeu com HTTP %s em %s %s",
             response.status_code,

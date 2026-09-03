@@ -1,4 +1,5 @@
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -6,6 +7,9 @@ import requests
 
 
 logger = logging.getLogger("supabase_memory")
+
+MAX_HISTORY_ROWS = 40
+MAX_MEMORY_ROWS = 20
 
 
 class SupabaseMemoryError(RuntimeError):
@@ -19,8 +23,8 @@ class SupabaseMemory:
         service_role_key: Optional[str],
         *,
         session: Optional[requests.Session] = None,
-        connect_timeout: float = 5.0,
-        read_timeout: float = 15.0,
+        connect_timeout: float = 3.0,
+        read_timeout: float = 10.0,
     ) -> None:
         self.url = (url or "").strip().rstrip("/")
         self.service_role_key = (service_role_key or "").strip()
@@ -52,6 +56,12 @@ class SupabaseMemory:
     ) -> Any:
         if not self.is_configured():
             raise SupabaseMemoryError("Supabase nao configurado.")
+        started = time.monotonic()
+        logger.info(
+            "request_started route=postgrest external_service=supabase operation=%s table=%s",
+            method,
+            table,
+        )
         try:
             response = self.session.request(
                 method=method,
@@ -63,14 +73,28 @@ class SupabaseMemory:
             )
             response.raise_for_status()
             if not response.content:
+                logger.info(
+                    "external_service=supabase duration_ms=%s result=success",
+                    int((time.monotonic() - started) * 1000),
+                )
                 return None
-            return response.json()
+            data = response.json()
+            logger.info(
+                "external_service=supabase duration_ms=%s result=success",
+                int((time.monotonic() - started) * 1000),
+            )
+            return data
+        except requests.Timeout as exc:
+            logger.warning(
+                "external_service=supabase duration_ms=%s result=timeout",
+                int((time.monotonic() - started) * 1000),
+            )
+            raise SupabaseMemoryError("Timeout no armazenamento Supabase.") from exc
         except (requests.RequestException, ValueError) as exc:
             status_code = getattr(getattr(exc, "response", None), "status_code", None)
             logger.warning(
-                "Falha no armazenamento Supabase: operation=%s table=%s status=%s",
-                method,
-                table,
+                "external_service=supabase duration_ms=%s result=error status=%s",
+                int((time.monotonic() - started) * 1000),
                 status_code,
             )
             raise SupabaseMemoryError("Falha no armazenamento Supabase.") from exc
@@ -127,6 +151,7 @@ class SupabaseMemory:
         conversation_id: str,
         limit: int,
     ) -> List[Dict[str, str]]:
+        bounded_limit = max(1, min(limit, MAX_HISTORY_ROWS))
         rows = self._request(
             "GET",
             "telegram_messages",
@@ -136,7 +161,7 @@ class SupabaseMemory:
                 "chat_id": f"eq.{chat_id}",
                 "conversation_id": f"eq.{conversation_id}",
                 "order": "created_at.desc,id.desc",
-                "limit": str(limit),
+                "limit": str(bounded_limit),
             },
         ) or []
         return [
@@ -176,6 +201,7 @@ class SupabaseMemory:
         conversation_id: str,
         limit: int,
     ) -> List[Dict[str, str]]:
+        bounded_limit = max(1, min(limit, MAX_MEMORY_ROWS))
         rows = self._request(
             "GET",
             "telegram_memories",
@@ -185,7 +211,7 @@ class SupabaseMemory:
                 "chat_id": f"eq.{chat_id}",
                 "conversation_id": f"eq.{conversation_id}",
                 "order": "updated_at.desc",
-                "limit": str(limit),
+                "limit": str(bounded_limit),
             },
         ) or []
         return [
