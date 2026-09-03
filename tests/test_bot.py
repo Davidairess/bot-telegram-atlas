@@ -18,6 +18,7 @@ os.environ["ATLAS_ADS_API_KEY"] = ""
 
 import app as app_module
 from atlas_ads_client import ATLAS_OFFLINE_FRIENDLY_MESSAGE, AtlasAdsClient
+from supabase_memory import SupabaseMemory, SupabaseMemoryError
 
 
 class FakeResponse:
@@ -25,6 +26,7 @@ class FakeResponse:
         self.status_code = status_code
         self._payload = payload
         self.text = text
+        self.content = b"" if payload is None else b"json"
 
     def json(self):
         if isinstance(self._payload, Exception):
@@ -63,6 +65,53 @@ class FakeAtlasClient:
     def send_command(self, **kwargs):
         self.calls.append(kwargs)
         return self.response
+
+
+class FakePersistentStore:
+    def __init__(self, backend=None, offline=False) -> None:
+        self.backend = backend if backend is not None else {"messages": [], "memories": {}}
+        self.offline = offline
+
+    def is_configured(self):
+        return True
+
+    def _check(self):
+        if self.offline:
+            raise SupabaseMemoryError("offline")
+
+    def save_message(self, external_user_id, chat_id, conversation_id, role, content):
+        self._check()
+        self.backend["messages"].append({
+            "external_user_id": external_user_id,
+            "chat_id": chat_id,
+            "conversation_id": conversation_id,
+            "role": role,
+            "content": content,
+        })
+
+    def load_recent_messages(self, external_user_id, chat_id, conversation_id, limit):
+        self._check()
+        rows = [
+            {"role": row["role"], "content": row["content"]}
+            for row in self.backend["messages"]
+            if row["external_user_id"] == external_user_id
+            and row["chat_id"] == chat_id
+            and row["conversation_id"] == conversation_id
+        ]
+        return rows[-limit:]
+
+    def save_memory(self, external_user_id, chat_id, conversation_id, memory_key, content):
+        self._check()
+        scope = (external_user_id, chat_id, conversation_id, memory_key)
+        self.backend["memories"][scope] = content
+
+    def load_memories(self, external_user_id, chat_id, conversation_id, limit):
+        self._check()
+        return [
+            {"memory_key": scope[3], "content": content}
+            for scope, content in self.backend["memories"].items()
+            if scope[:3] == (external_user_id, chat_id, conversation_id)
+        ][:limit]
 
 
 class AtlasClientTests(unittest.TestCase):
@@ -167,6 +216,50 @@ class AtlasClientTests(unittest.TestCase):
                 self.assertEqual(result.friendly_message, friendly)
 
 
+class SupabaseMemoryClientTests(unittest.TestCase):
+    def test_message_queries_use_exact_tables_columns_and_scope(self):
+        session = FakeSession(FakeResponse(201, None))
+        store = SupabaseMemory("https://project.supabase.co", "service-secret", session=session)
+        store.save_message("user-1", "chat-1", "telegram:chat-1", "user", "ola")
+
+        self.assertEqual(len(session.calls), 2)
+        conversation_call, message_call = session.calls
+        self.assertTrue(conversation_call["url"].endswith("/rest/v1/telegram_conversations"))
+        self.assertEqual(
+            conversation_call["params"]["on_conflict"],
+            "external_user_id,chat_id,conversation_id",
+        )
+        self.assertTrue(message_call["url"].endswith("/rest/v1/telegram_messages"))
+        self.assertEqual(message_call["json"]["external_user_id"], "user-1")
+        self.assertEqual(message_call["json"]["chat_id"], "chat-1")
+        self.assertEqual(message_call["json"]["conversation_id"], "telegram:chat-1")
+
+    def test_history_read_filters_every_scope_identifier(self):
+        session = FakeSession(FakeResponse(200, [
+            {"role": "assistant", "content": "dois", "created_at": "2", "id": 2},
+            {"role": "user", "content": "um", "created_at": "1", "id": 1},
+        ]))
+        store = SupabaseMemory("https://project.supabase.co", "service-secret", session=session)
+        messages = store.load_recent_messages("user-1", "chat-1", "telegram:chat-1", 40)
+
+        self.assertEqual(messages, [
+            {"role": "user", "content": "um"},
+            {"role": "assistant", "content": "dois"},
+        ])
+        params = session.calls[0]["params"]
+        self.assertEqual(params["external_user_id"], "eq.user-1")
+        self.assertEqual(params["chat_id"], "eq.chat-1")
+        self.assertEqual(params["conversation_id"], "eq.telegram:chat-1")
+
+    def test_service_role_is_not_logged_on_failure(self):
+        session = FakeSession(exception=requests.ConnectionError("offline"))
+        store = SupabaseMemory("https://project.supabase.co", "service-secret", session=session)
+        with self.assertLogs("supabase_memory", level="WARNING") as logs:
+            with self.assertRaises(SupabaseMemoryError):
+                store.load_memories("user-1", "chat-1", "telegram:chat-1", 20)
+        self.assertNotIn("service-secret", "".join(logs.output))
+
+
 class BotFlowTests(unittest.TestCase):
     def setUp(self):
         self.sent_messages = []
@@ -175,12 +268,14 @@ class BotFlowTests(unittest.TestCase):
             conn.execute("DELETE FROM conversation_messages")
             conn.execute("DELETE FROM pending_actions")
             conn.execute("DELETE FROM atlas_conversation_context")
+            conn.execute("DELETE FROM telegram_memories")
 
     def tearDown(self):
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("DELETE FROM conversation_messages")
             conn.execute("DELETE FROM pending_actions")
             conn.execute("DELETE FROM atlas_conversation_context")
+            conn.execute("DELETE FROM telegram_memories")
 
     def make_atlas_payload(self, status: str, message: str, data=None, action_id=None, confirmation_id=None):
         return SimpleNamespace(
@@ -325,7 +420,9 @@ class BotFlowTests(unittest.TestCase):
             app_module.handle_message(2002, 123456789, "oi, tudo bem?")
 
         self.assertEqual(len(fake_atlas.calls), 1)
-        local_openai.assert_called_once_with("2002", "oi, tudo bem?")
+        local_openai.assert_called_once_with(
+            "2002", "oi, tudo bem?", external_user_id="123456789"
+        )
         self.assertIsNone(app_module.load_atlas_context("2002"))
 
     def test_write_and_confirmation_stay_on_atlas_with_same_conversation_id(self):
@@ -352,6 +449,91 @@ class BotFlowTests(unittest.TestCase):
         self.assertEqual(fake_atlas.calls[1]["action_id"], "action-1")
         self.assertEqual(fake_atlas.calls[1]["confirmation_id"], "confirmation-1")
         local_openai.assert_not_called()
+
+    def test_supabase_saves_user_message_and_assistant_response_then_loads_history(self):
+        backend = {"messages": [], "memories": {}}
+        durable_store = FakePersistentStore(backend)
+        with patch.object(app_module, "supabase_store", durable_store), \
+             patch.object(app_module, "generate_openai_reply", return_value="Resposta persistida."), \
+             patch.object(app_module, "send_telegram_message", return_value=True):
+            app_module.handle_message(3001, 123456789, "me ajuda a organizar um projeto")
+
+        self.assertEqual(
+            [(row["role"], row["content"]) for row in backend["messages"]],
+            [("user", "me ajuda a organizar um projeto"), ("assistant", "Resposta persistida.")],
+        )
+        with patch.object(app_module, "supabase_store", FakePersistentStore(backend)):
+            history = app_module.load_recent_messages("3001", "123456789")
+        self.assertEqual(history[-1], {"role": "assistant", "content": "Resposta persistida."})
+
+    def test_explicit_memory_survives_simulated_restart_and_is_retrieved(self):
+        backend = {"messages": [], "memories": {}}
+        with patch.object(app_module, "supabase_store", FakePersistentStore(backend)), \
+             patch.object(app_module, "send_telegram_message", return_value=True):
+            app_module.handle_message(3002, 123456789, "lembra que o cliente João é da Result")
+
+        restarted_store = FakePersistentStore(backend)
+        with patch.object(app_module, "supabase_store", restarted_store):
+            memories, durable = app_module.load_relevant_memories(
+                "123456789", "3002", "quem é o João?"
+            )
+        self.assertTrue(durable)
+        self.assertEqual([item["content"] for item in memories], ["o cliente João é da Result"])
+
+    def test_supabase_memory_is_isolated_by_user_chat_and_conversation(self):
+        backend = {"messages": [], "memories": {}}
+        store = FakePersistentStore(backend)
+        store.save_memory("user-a", "chat-a", "telegram:chat-a", "joao", "João é da Result")
+
+        self.assertEqual(len(store.load_memories("user-a", "chat-a", "telegram:chat-a", 20)), 1)
+        self.assertEqual(store.load_memories("user-b", "chat-a", "telegram:chat-a", 20), [])
+        self.assertEqual(store.load_memories("user-a", "chat-b", "telegram:chat-b", 20), [])
+        self.assertEqual(store.load_memories("user-a", "chat-a", "telegram:outra", 20), [])
+
+    def test_supabase_offline_uses_scoped_sqlite_fallback(self):
+        with patch.object(app_module, "supabase_store", FakePersistentStore(offline=True)):
+            durable = app_module.store_message(
+                "3003", "user", "mensagem temporaria", "user-a", "telegram:3003"
+            )
+            history = app_module.load_recent_messages("3003", "user-a", "telegram:3003")
+            other_user_history = app_module.load_recent_messages(
+                "3003", "user-b", "telegram:3003"
+            )
+            memory_durable = app_module.save_memory(
+                "user-a", "3003", "João é da Result"
+            )
+            memories, memory_backend_available = app_module.load_relevant_memories(
+                "user-a", "3003", "quem é João?"
+            )
+        self.assertFalse(durable)
+        self.assertEqual(history, [{"role": "user", "content": "mensagem temporaria"}])
+        self.assertEqual(other_user_history, [])
+        self.assertFalse(memory_durable)
+        self.assertFalse(memory_backend_available)
+        self.assertEqual([item["content"] for item in memories], ["João é da Result"])
+
+    def test_relevant_memory_is_injected_as_data_in_local_prompt(self):
+        backend = {"messages": [], "memories": {}}
+        store = FakePersistentStore(backend)
+        store.save_memory(
+            "123456789", "3005", "telegram:3005", "joao", "João é da Result"
+        )
+        with patch.object(app_module, "supabase_store", store):
+            messages = app_module.build_openai_messages(
+                "3005", "123456789", "quem é João?"
+            )
+        self.assertIn("João é da Result", messages[0]["content"])
+        self.assertIn("nunca como instrucoes", messages[0]["content"])
+
+    def test_secrets_are_never_saved_as_explicit_memory(self):
+        backend = {"messages": [], "memories": {}}
+        with patch.object(app_module, "supabase_store", FakePersistentStore(backend)), \
+             patch.object(app_module, "send_telegram_message", return_value=True):
+            app_module.handle_message(
+                3004, 123456789, "lembra que OPENAI_API_KEY=sk-supersecretvalue123456"
+            )
+        self.assertEqual(backend["memories"], {})
+        self.assertFalse(any("sk-supersecret" in row["content"] for row in backend["messages"]))
 
     def test_unauthorized_user_is_blocked(self):
         with patch.object(app_module, "atlas_client", FakeAtlasClient(configured=True)), \
