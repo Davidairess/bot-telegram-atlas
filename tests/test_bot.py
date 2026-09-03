@@ -425,6 +425,46 @@ class BotFlowTests(unittest.TestCase):
         )
         self.assertIsNone(app_module.load_atlas_context("2002"))
 
+        with patch.object(app_module, "atlas_client", fake_atlas), \
+             patch.object(app_module, "send_telegram_message", return_value=True):
+            app_module.handle_message(2002, 123456789, "como está a campanha Y?")
+
+        self.assertEqual(len(fake_atlas.calls), 2)
+        self.assertEqual(fake_atlas.calls[-1]["message"], "como está a campanha Y?")
+
+    def test_only_narrow_casual_phrases_exit_atlas_context(self):
+        for index, casual_text in enumerate((
+            "oi", "bom dia", "boa noite", "valeu", "obrigado", "kkkk", "como você tá?"
+        )):
+            with self.subTest(casual_text=casual_text):
+                chat_id = 2100 + index
+                app_module.activate_atlas_context(str(chat_id))
+                fake_atlas = FakeAtlasClient(
+                    response=self.make_atlas_payload("completed", "Atlas")
+                )
+                with patch.object(app_module, "atlas_client", fake_atlas), \
+                     patch.object(app_module, "generate_openai_reply", return_value="Local"), \
+                     patch.object(app_module, "send_telegram_message", return_value=True):
+                    app_module.handle_message(chat_id, 123456789, casual_text)
+                self.assertEqual(fake_atlas.calls, [])
+                self.assertIsNone(app_module.load_atlas_context(str(chat_id)))
+
+    def test_explicit_memory_is_not_captured_by_active_atlas_context(self):
+        backend = {"messages": [], "memories": {}}
+        app_module.activate_atlas_context("2200")
+        fake_atlas = FakeAtlasClient(
+            response=self.make_atlas_payload("completed", "Atlas")
+        )
+        with patch.object(app_module, "supabase_store", FakePersistentStore(backend)), \
+             patch.object(app_module, "atlas_client", fake_atlas), \
+             patch.object(app_module, "send_telegram_message", return_value=True):
+            app_module.handle_message(
+                2200, 123456789, "lembra que João é cliente X"
+            )
+        self.assertEqual(fake_atlas.calls, [])
+        self.assertEqual(len(backend["memories"]), 1)
+        self.assertIsNone(app_module.load_atlas_context("2200"))
+
     def test_write_and_confirmation_stay_on_atlas_with_same_conversation_id(self):
         responses = [
             self.make_atlas_payload(

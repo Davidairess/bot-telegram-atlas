@@ -137,6 +137,11 @@ CLEAR_LOCAL_CONVERSATION_PATTERNS = (
     "boa noite",
     "como voce esta",
     "como vai voce",
+    "como voce ta",
+    "valeu",
+    "obrigado",
+    "obrigada",
+    "kkkk",
     "me ajuda a organizar um projeto",
 )
 
@@ -744,7 +749,8 @@ def detect_ads_intent(text: str) -> Optional[Dict[str, str]]:
 
 
 def is_clearly_local_conversation(text: str) -> bool:
-    normalized = normalize_text(text).strip(" !?.")
+    normalized = re.sub(r"[^\w\s]", " ", normalize_text(text))
+    normalized = " ".join(normalized.split())
     return normalized in CLEAR_LOCAL_CONVERSATION_PATTERNS
 
 
@@ -1004,7 +1010,21 @@ def handle_message(chat_id: int, user_id: Optional[int], user_text: str) -> None
                     if intent["kind"] == "action"
                     else handle_atlas_query(chat_key, user_id or 0, user_text)
                 )
-            elif explicit_memory is None and load_atlas_context(chat_key) and not is_clearly_local_conversation(user_text):
+            elif (
+                explicit_memory is None
+                and load_atlas_context(chat_key)
+                and is_clearly_local_conversation(user_text)
+            ):
+                clear_atlas_context(chat_key)
+                logger.info(
+                    "route=local_openai chat_id=%s message_length=%s reason=explicit_local_exit",
+                    chat_id,
+                    len(user_text),
+                )
+                reply_text = generate_openai_reply(
+                    chat_key, user_text, external_user_id=user_key
+                )
+            elif explicit_memory is None and load_atlas_context(chat_key):
                 logger.info(
                     "route=atlas chat_id=%s message_length=%s reason=atlas_context",
                     chat_id,
@@ -1012,13 +1032,10 @@ def handle_message(chat_id: int, user_id: Optional[int], user_text: str) -> None
                 )
                 reply_text = handle_atlas_query(chat_key, user_id or 0, user_text)
             elif explicit_memory is None:
-                reason = "explicit_local_exit" if load_atlas_context(chat_key) else "no_ads_context"
-                clear_atlas_context(chat_key)
                 logger.info(
-                    "route=local_openai chat_id=%s message_length=%s reason=%s",
+                    "route=local_openai chat_id=%s message_length=%s reason=no_ads_context",
                     chat_id,
                     len(user_text),
-                    reason,
                 )
                 reply_text = generate_openai_reply(
                     chat_key, user_text, external_user_id=user_key
